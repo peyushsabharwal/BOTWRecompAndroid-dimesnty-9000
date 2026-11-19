@@ -1,0 +1,1200 @@
+name: Build APK (D9000)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      NDK_VERSION: 30.0.16248370
+      CMAKE_VERSION: 3.30.4
+    steps:
+      - name: Check out the code and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Save a copy of the current source (for review)
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-source
+          path: runtime
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install helper tools
+        run: sudo apt-get update && sudo apt-get install -y bzip2 patch xz-utils
+
+      - name: Install the Android NDK, CMake and platform
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" "platforms;android-36"
+          # The runner has its own NDK variables; point them at the version the project needs
+          {
+            echo "ANDROID_NDK=$ANDROID_HOME/ndk/$NDK_VERSION"
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION"
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore prebuilt libraries (if cached)
+        uses: actions/cache@v4
+        with:
+          path: android/deps/out
+          key: deps-${{ hashFiles('android/deps/build_deps.sh', 'android/deps/build_ffmpeg.sh', 'android/deps/sdl-aaudio-resume.patch') }}
+
+      - name: Build SDL3, shaderc and headers
+        run: bash android/deps/build_deps.sh
+
+      - name: Build FFmpeg
+        run: |
+          if [ ! -f android/deps/out/lib/libavcodec.so ]; then
+            ANDROID_NDK_LINUX="$ANDROID_HOME/ndk/$NDK_VERSION" bash android/deps/build_ffmpeg.sh
+          fi
+
+      - name: Apply our changes (frame profiler switch)
+        run: |
+          cat > /tmp/prof-toggle.patch <<'PATCH_EOF'
+          diff --git a/runtime/nvn/vulkan/exec.c b/runtime/nvn/vulkan/exec.c
+          index a7afd32..c5d20a8 100644
+          --- a/runtime/nvn/vulkan/exec.c
+          +++ b/runtime/nvn/vulkan/exec.c
+          @@ -1469,2 +1469,5 @@ void vk_exec_init(void) {
+               prof = getenv("LARECOMP_VK_PROF") != NULL;
+          +#ifdef __ANDROID__
+          +    if (g_settings.vk_prof) prof = 1;
+          +#endif
+           #ifdef __ANDROID__
+          diff --git a/runtime/settings.c b/runtime/settings.c
+          index 5cdcdbb..e10d322 100644
+          --- a/runtime/settings.c
+          +++ b/runtime/settings.c
+          @@ -276,2 +276,3 @@ void settings_load(void) {
+                   else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
+          +        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;
+                   else if (!strcmp(key, "gpu_model")) snprintf(g_settings.gpu_model, sizeof g_settings.gpu_model, "%s", val);
+          diff --git a/runtime/settings.h b/runtime/settings.h
+          index 1094345..37fe46e 100644
+          --- a/runtime/settings.h
+          +++ b/runtime/settings.h
+          @@ -58,2 +58,3 @@ typedef struct {
+               bool log_file;        // the log in a file as well (platform/android.c), to send with a report
+          +    bool vk_prof;         // the frame profiler (vulkan/exec.c, LARECOMP_VK_PROF): where each frame's CPU time goes, in the log; read when the game starts
+               char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver
+          diff --git a/runtime/ui/launcher.mm b/runtime/ui/launcher.mm
+          index c15eef9..553e7a5 100644
+          --- a/runtime/ui/launcher.mm
+          +++ b/runtime/ui/launcher.mm
+          @@ -1658,2 +1658,8 @@ static void prelaunch_tab(float sc) {
+                   ImGui::PopID();
+          +        ImGui::Spacing();
+          +        if (ImGui::Checkbox(tr("Frame profiler"), &g_settings.vk_prof)) changed = true;
+          +        ImGui::TextDisabled("%s", tr("Adds to the log where each frame's time goes (draw setup, pipelines, descriptor sets, "
+          +                                  "textures, vertices, GPU) and lists every frame over 50 ms. It slows the game a "
+          +                                  "little and makes the log longer: for bug reports only. Applies the next time the "
+          +                                  "game starts."));
+                   ImGui::PopTextWrapPos();
+          PATCH_EOF
+          git apply --verbose /tmp/prof-toggle.patch
+          python3 - <<'PY_EOF'
+          p = 'runtime/settings.c'
+          s = open(p, encoding='utf-8').read()
+          old = 'fprintf(f, "show_fps = %d\\n", g_settings.show_fps);'
+          assert s.count(old) == 1, 'show_fps save line not found exactly once'
+          j = s.index('\n', s.index(old)) + 1
+          s = s[:j] + '#ifdef __ANDROID__\n    fprintf(f, "vk_prof = %d\\n", g_settings.vk_prof);\n#endif\n' + s[j:]
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF
+          # the frame profiler also asks for the GPU time per pass of one frame in 600 (the "[gpuprof]" lines)
+          python3 - <<'PY_EOF2'
+          p = 'runtime/nvn/vulkan/device.c'
+          s = open(p, encoding='utf-8').read()
+          old = 'const char *e = getenv("LARECOMP_GPUPROF_AT");'
+          assert s.count(old) == 1, 'GPUPROF_AT line not found exactly once'
+          i = s.index(old)
+          ins = '#ifdef __ANDROID__\n        if (g_settings.vk_prof && total_frames % 600 == 300) g_gpuprof_frame = true;\n#endif\n        '
+          s = s[:i] + ins + s[i:]
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF2
+          # the frame profiler also turns on the pace trace: every 2 s, the game thread's and the render thread's busy ms per frame
+          python3 - <<'PY_EOF3'
+          p = 'runtime/nvn/vulkan/exec.c'
+          s = open(p, encoding='utf-8').read()
+          old = 'trace = e && atoi(e) != 0; }'
+          assert s.count(old) == 1, 'pace trace line not found exactly once'
+          s = s.replace(old, 'trace = (e && atoi(e) != 0) || g_settings.vk_prof; }')
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF3
+          # the frame profiler also counts draws per fragment shader ([fshist] lines, every ~10 s)
+          cat > /tmp/fs_hist.c <<'HELPER_EOF'
+          #ifdef __ANDROID__
+          // draws per fragment shader, logged every 300 frames ([fshist])
+          static void fs_hist_note(uint64_t h) {
+              static uint64_t hs[512];
+              static uint32_t cs[512], total;
+              static uint64_t start_frame;
+              uint64_t f = renderer_present_count();
+              if (!start_frame) start_frame = f;
+              if (f - start_frame >= 300) {
+                  double frames = (double)(f - start_frame);
+                  char line[1024];
+                  int n = snprintf(line, sizeof line, "[fshist] %.0f frames, %.0f draws a frame |", frames, total / frames);
+                  for (int k = 0; k < 12; k++) {
+                      int best = -1;
+                      for (int i = 0; i < 512; i++)
+                          if (cs[i] && (best < 0 || cs[i] > cs[best])) best = i;
+                      if (best < 0 || n > (int)sizeof line - 48) break;
+                      n += snprintf(line + n, sizeof line - n, " %016llx %.1f |", (unsigned long long)hs[best], cs[best] / frames);
+                      cs[best] = 0;
+                  }
+                  LOG("%s\n", line);
+                  memset(cs, 0, sizeof cs);
+                  total = 0;
+                  start_frame = f;
+              }
+              unsigned i = (unsigned)((h * 0x9E3779B97F4A7C15ull) >> 55);
+              for (unsigned k = 0; k < 512; k++, i = (i + 1) & 511) {
+                  if (cs[i] && hs[i] != h) continue;
+                  hs[i] = h;
+                  cs[i]++;
+                  break;
+              }
+              total++;
+          }
+          #endif
+          HELPER_EOF
+          python3 - <<'PY_EOF4'
+          p = 'runtime/nvn/vulkan/exec.c'
+          s = open(p, encoding='utf-8').read()
+          helper = open('/tmp/fs_hist.c', encoding='utf-8').read()
+          anchor = 'static uint64_t prof_tp_;\n'
+          assert s.count(anchor) == 1, 'prof_tp_ anchor not found exactly once'
+          s = s.replace(anchor, helper + anchor)
+          call = '        g_cur_fs_hash = last_hash;\n'
+          assert s.count(call) == 1, 'g_cur_fs_hash line not found exactly once'
+          s = s.replace(call, call + '#ifdef __ANDROID__\n        if (g_settings.vk_prof) fs_hist_note(last_hash);\n#endif\n')
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF4
+          # Video tab > Performance: Skip shadows (moved here from Prelaunch), Disable grass, Texture quality, Anisotropic filtering
+          cat > /tmp/grass_helper.c <<'HELPER_EOF2'
+          #ifdef __ANDROID__
+          // grass = a vertex shader that reads an RGBA16 UNORM texture (NVN 0x2A); logged as [grass]
+          static bool draw_is_grass(Prog *pr) {
+              static struct { uint64_t vs; uint8_t v; } memo[256];  // v: 1 grass, 2 not
+              uint64_t vs = st.program->stages[0].code_addr;
+              unsigned i = (unsigned)((vs * 0x9E3779B97F4A7C15ull) >> 56);
+              if (memo[i].vs == vs && memo[i].v) return memo[i].v == 1;
+              bool grass = false, all = true;
+              if (pr->vi) for (int k = 0; k < pr->vi->ntex; k++) {
+                  NvnTexture *t = shader_texture_object(0, &pr->vi->tex[k]);
+                  if (!t) all = false;
+                  else if (t->format == 0x2A) grass = true;
+              }
+              if (grass || all) {  // (a texture not bound yet: asked again at the next draw)
+                  memo[i].vs = vs, memo[i].v = grass ? 1 : 2;
+                  if (grass) LOG("[grass] vertex shader %llx reads an RGBA16 texture: its draws are skipped\n", (unsigned long long)vs);
+              }
+              return grass;
+          }
+          // Skip shaders: fragment-shader hashes from g_settings.skip_fs, read again every 30 frames
+          static uint64_t skip_dyn[16];
+          static int nskip_dyn;
+          static void skip_dyn_refresh(void) {
+              static char src[256];
+              static uint64_t chk = ~0ull;
+              uint64_t c = renderer_present_count() / 30;
+              if (c == chk) return;
+              chk = c;
+              if (!strcmp(src, g_settings.skip_fs)) return;
+              snprintf(src, sizeof src, "%s", g_settings.skip_fs);
+              int n = 0;
+              for (const char *p = src; *p && n < 16;) {
+                  while (*p && !isxdigit((unsigned char)*p)) p++;
+                  if (!*p) break;
+                  char *e;
+                  unsigned long long h = strtoull(p, &e, 16);
+                  if (e == p) break;
+                  skip_dyn[n++] = h;
+                  p = e;
+              }
+              nskip_dyn = n;
+              LOG("[vk] skip shaders: %d\n", n);
+          }
+          #endif
+          HELPER_EOF2
+          python3 - <<'PY_EOF5'
+          def edit(path, old, new):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == 1, (path, old[:60])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+          edit('runtime/settings.h',
+               '    bool vk_prof;',
+               '    bool skip_shadows;    // Video > Performance: no shadow maps\n'
+               '    char skip_fs[256];    // Skip shaders: fragment shader hashes (hex, comma separated) whose draws are skipped\n'
+               '    bool skip_grass;      // Video > Performance: no grass (exec.c draw_is_grass)\n'
+               '    int tex_quality;      // Texture quality: 0 Auto, 1 Low, 2 Normal\n'
+               '    int aniso_cap;        // Anisotropy cap: 0 default, 1 off, 2/4/8\n'
+               '    bool vk_prof;')
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "skip_shadows")) g_settings.skip_shadows = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "skip_grass")) g_settings.skip_grass = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "skip_fs")) snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", val);\n'
+               '        else if (!strcmp(key, "tex_quality")) { int v = atoi(val); g_settings.tex_quality = v == 1 || v == 2 ? v : 0; }\n'
+               '        else if (!strcmp(key, "aniso_cap")) { int v = atoi(val); g_settings.aniso_cap = v == 1 || v == 2 || v == 4 || v == 8 ? v : 0; }\n')
+          edit('runtime/settings.c',
+               '    fprintf(f, "vk_prof = %d\\n", g_settings.vk_prof);\n',
+               '    fprintf(f, "vk_prof = %d\\n", g_settings.vk_prof);\n'
+               '    fprintf(f, "skip_shadows = %d\\nskip_grass = %d\\ntex_quality = %d\\naniso_cap = %d\\n", g_settings.skip_shadows,\n'
+               '            g_settings.skip_grass, g_settings.tex_quality, g_settings.aniso_cap);\n'
+               '    fprintf(f, "skip_fs = %s\\n", g_settings.skip_fs);\n')
+          edit('runtime/settings.c',
+               '    g_settings.files_in_place = d->files_in_place;\n',
+               '    g_settings.files_in_place = d->files_in_place;\n'
+               '    g_settings.skip_shadows = d->skip_shadows;\n'
+               '    g_settings.skip_grass = d->skip_grass;\n'
+               '    g_settings.tex_quality = d->tex_quality;\n'
+               '    g_settings.aniso_cap = d->aniso_cap;\n'
+               '    snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", d->skip_fs);\n')
+          edit('runtime/ui/menu.mm',
+               '#endif\n    opt_end();\n}\n\nstatic void tab_audio(void) {',
+               '    opt_section("Performance");\n'
+               '    {\n'
+               '        static const char *pn[] = {"Custom", "Quality", "Balanced", "Fast"};\n'
+               '        static const int pv[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 1, 4}, {1, 1, 1, 2}};  // shadows, grass, textures, aniso\n'
+               '        int cur = 0;\n'
+               '        for (int p = 1; p < 4; p++)\n'
+               '            if (g_settings.skip_shadows == pv[p][0] && g_settings.skip_grass == pv[p][1] && g_settings.tex_quality == pv[p][2] &&\n'
+               '                g_settings.aniso_cap == pv[p][3]) cur = p;\n'
+               '        int pi = cur;\n'
+               '        if (opt_choice("Performance preset", &pi, pn, 4, 1,\n'
+               '                       "Quality: nothing skipped, textures as Auto. Balanced: low textures, 4x anisotropy. Fast: no shadows or grass, low textures, "\n'
+               '                       "2x anisotropy. Sets the options below; change one of them and this shows Custom.", false) && pi > 0 && pi != cur) {\n'
+               '            g_settings.skip_shadows = pv[pi][0];\n'
+               '            g_settings.skip_grass = pv[pi][1];\n'
+               '            g_settings.tex_quality = pv[pi][2];\n'
+               '            g_settings.aniso_cap = pv[pi][3];\n'
+               '        }\n'
+               '    }\n'
+               '    opt_toggle("Skip shadows (experimental)", &g_settings.skip_shadows, false,\n'
+               '               "Does not draw shadows: less work, no shadows. Applies at once.");\n'
+               '    opt_toggle("Disable grass (experimental)", &g_settings.skip_grass, false,\n'
+               '               "Does not draw grass. It is found by how it is drawn, so something else may go with it. Applies at once.");\n'
+               '    {\n'
+               '        static const char *tq[] = {"Auto", "Low", "Normal"};\n'
+               '        opt_choice("Texture quality", &g_settings.tex_quality, tq, 3, 0,\n'
+               '                   "Low: half-size textures, a quarter of the memory, softer. Normal: full size. Auto: Low where RAM saving is on. "\n'
+               '                   "Normal on 4 GB phones may run out of memory. Applies to textures loaded from now on: restart the game.",\n'
+               '                   false);\n'
+               '    }\n'
+               '    {\n'
+               '        static const char *an[] = {"Game\'s", "Off", "2x", "4x", "8x"};\n'
+               '        static const int an_v[] = {0, 1, 2, 4, 8};\n'
+               '        int ai = 0;\n'
+               '        for (int i = 0; i < 5; i++) if (an_v[i] == g_settings.aniso_cap) ai = i;\n'
+               '        if (opt_choice("Anisotropic filtering", &ai, an, 5, 0,\n'
+               '                       "A cap on anisotropic filtering (sharper ground seen at a slant). Lower is lighter for the GPU. Applies the next time the game starts.", false))\n'
+               '            g_settings.aniso_cap = an_v[ai];\n'
+               '    }\n'
+               '    if (opt_text("Skip shaders", g_settings.skip_fs, sizeof g_settings.skip_fs, "none",\n'
+               '                 "Draws of these fragment shaders are not made. Paste hashes from the Frame profiler\'s [fshist] log lines, separated by commas. "\n'
+               '                 "A wrong one can hide things: clear the box to undo. Applies within a second.")) settings_save();\n'
+               '#endif\n    opt_end();\n}\n\nstatic void tab_audio(void) {')
+          edit('runtime/nvn/vulkan/exec.c',
+               '    if (prof) prof_tp_ = SDL_GetTicksNS();\n    if (!st.program) { stat_skipped++; return; }\n',
+               '    if (prof) prof_tp_ = SDL_GetTicksNS();\n    if (!st.program) { stat_skipped++; return; }\n'
+               '#ifdef __ANDROID__\n'
+               '    if (g_settings.skip_shadows && st.rt.depth && st.rt.ncolor == 0) { stat_skipped++; return; }  // (depth-only: the shadow maps)\n'
+               '#endif\n')
+          helper = open('/tmp/grass_helper.c', encoding='utf-8').read()
+          edit('runtime/nvn/vulkan/exec.c', 'static uint64_t prof_tp_;\n', helper + 'static uint64_t prof_tp_;\n')
+          edit('runtime/nvn/vulkan/exec.c',
+               '        for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }\n',
+               '        for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }\n'
+               '#ifdef __ANDROID__\n'
+               '        skip_dyn_refresh();\n'
+               '        for (int i = 0; i < nskip_dyn; i++) if (last_hash == skip_dyn[i]) { stat_skipped++; return; }\n'
+               '        if (g_settings.skip_grass && draw_is_grass(pr)) { stat_skipped++; return; }\n'
+               '#endif\n')
+          edit('runtime/nvn/vulkan/textures.c',
+               '#include "../texpatch.h"\n',
+               '#include "../texpatch.h"\n#include "../../settings.h"\n')
+          edit('runtime/nvn/vulkan/textures.c',
+               '        static int half = -1;\n'
+               '        if (half < 0) {\n'
+               '            extern bool vk_low_ram(void);\n'
+               '            const char *e = getenv("LARECOMP_HALF_TEXTURES");\n'
+               '            half = e ? atoi(e) != 0 : vk_low_ram();\n'
+               '            if (half) LOG("[vk] textures from their second level (half size): low RAM\\n");\n'
+               '        }\n',
+               '        static int half_auto = -1;\n'
+               '        if (half_auto < 0) {\n'
+               '            extern bool vk_low_ram(void);\n'
+               '            const char *e = getenv("LARECOMP_HALF_TEXTURES");\n'
+               '            half_auto = e ? atoi(e) != 0 : vk_low_ram();\n'
+               '            if (half_auto) LOG("[vk] textures from their second level (half size): low RAM\\n");\n'
+               '        }\n'
+               '        // Video > Performance > Texture quality: 1 Low, 2 Normal, 0 Auto (the above); for textures made from now on\n'
+               '        int half = g_settings.tex_quality == 1 ? 1 : g_settings.tex_quality == 2 ? 0 : half_auto;\n')
+          edit('runtime/nvn/vulkan/textures.c',
+               '    if (stest && mf > 1) { si.minLod = 0; si.maxLod = VK_LOD_CLAMP_NONE; si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = 16; }\n',
+               '    if (stest && mf > 1) { si.minLod = 0; si.maxLod = VK_LOD_CLAMP_NONE; si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = 16; }\n'
+               '    {   // Video > Performance > Anisotropic filtering: a cap on the game\'s own (samplers are made once: the next start)\n'
+               '        int cap = g_settings.aniso_cap;\n'
+               '        if (cap == 1) si.anisotropyEnable = VK_FALSE;\n'
+               '        else if (cap > 1 && si.anisotropyEnable && si.maxAnisotropy > (float)cap) si.maxAnisotropy = (float)cap;\n'
+               '    }\n')
+          PY_EOF5
+          git diff --stat
+
+      - name: Apply extra performance toggles (pacing, workers, priority, caches, shader groups)
+        run: |
+          cat > /tmp/extra_toggles.py <<'PY_EXTRA'
+          # Extra performance toggles, applied after the "frame profiler" step. Run from the repository root.
+          import os, sys
+
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:70])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- settings -----------------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', '    bool vk_prof;',
+               '    int particles;        // Video > Performance > Particles: 0 Normal, 1 Low (half the draws), 2 Off (shader_groups.h)\n'
+               '    bool no_ambient;      // Disable ambient effects (shader_groups.h)\n'
+               '    unsigned skip_named;  // bit i: the i-th named shader toggle (shader_groups.h SG_NAMED) is on\n'
+               '    int vc_budget_mb;     // GPU geometry cache budget, MB (0: Automatic); read when the game starts (exec.c vc_budget)\n'
+               '    bool framepace_off;   // the game\'s own pacing and clock, not the runtime\'s (hle/framepace.c); read when the game starts\n'
+               '    int shader_workers;   // threads that compile shaders (0: Automatic, 1..4); read when the first one is needed\n'
+               '    int compile_prio;     // their priority: -1 low, 0 normal, 1 high\n'
+               '    bool vk_prof;')
+
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "skip_fs")) snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", val);\n',
+               '        else if (!strcmp(key, "skip_fs")) snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", val);\n'
+               '        else if (!strcmp(key, "particles")) { int v = atoi(val); g_settings.particles = v < 0 ? 0 : v > 2 ? 2 : v; }\n'
+               '        else if (!strcmp(key, "no_ambient")) g_settings.no_ambient = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "skip_named")) g_settings.skip_named = (unsigned)strtoul(val, NULL, 10);\n'
+               '        else if (!strcmp(key, "vc_budget_mb")) { int v = atoi(val); g_settings.vc_budget_mb = v <= 0 ? 0 : v < 128 ? 128 : v > 2048 ? 2048 : v; }\n'
+               '        else if (!strcmp(key, "framepace_off")) g_settings.framepace_off = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "shader_workers")) { int v = atoi(val); g_settings.shader_workers = v < 0 ? 0 : v > 4 ? 4 : v; }\n'
+               '        else if (!strcmp(key, "compile_prio")) { int v = atoi(val); g_settings.compile_prio = v < 0 ? -1 : v > 0 ? 1 : 0; }\n')
+          edit('runtime/settings.c',
+               '    fprintf(f, "skip_fs = %s\\n", g_settings.skip_fs);\n',
+               '    fprintf(f, "skip_fs = %s\\n", g_settings.skip_fs);\n'
+               '    fprintf(f, "particles = %d\\nno_ambient = %d\\nskip_named = %u\\nvc_budget_mb = %d\\n", g_settings.particles,\n'
+               '            g_settings.no_ambient, g_settings.skip_named, g_settings.vc_budget_mb);\n'
+               '    fprintf(f, "framepace_off = %d\\nshader_workers = %d\\ncompile_prio = %d\\n", g_settings.framepace_off,\n'
+               '            g_settings.shader_workers, g_settings.compile_prio);\n')
+          edit('runtime/settings.c',
+               '    snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", d->skip_fs);\n',
+               '    snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", d->skip_fs);\n'
+               '    g_settings.particles = d->particles;\n'
+               '    g_settings.no_ambient = d->no_ambient;\n'
+               '    g_settings.skip_named = d->skip_named;\n'
+               '    g_settings.vc_budget_mb = d->vc_budget_mb;\n'
+               '    g_settings.framepace_off = d->framepace_off;\n'
+               '    g_settings.shader_workers = d->shader_workers;\n'
+               '    g_settings.compile_prio = d->compile_prio;\n')
+
+          # ---- frame pacing off: the game's own pacing and clock (LARECOMP_FRAMEPACE=0) -------------------------------------
+          edit('runtime/hle/framepace.c',
+               '    if (on < 0) on = g_game_version >= 182 && env_int("LARECOMP_FRAMEPACE", 1) != 0;\n',
+               '    if (on < 0) on = g_game_version >= 182 && env_int("LARECOMP_FRAMEPACE", 1) != 0;\n'
+               '#ifdef __ANDROID__\n'
+               '    if (on > 0 && g_settings.framepace_off) on = 0;  // (read once: restart the game)\n'
+               '#endif\n')
+
+          # ---- the known-shader lists ---------------------------------------------------------------------------------------
+          open('runtime/nvn/vulkan/shader_groups.h', 'w', encoding='utf-8').write('''\
+          // Known fragment shaders, by what they draw: hashes as the [fshist] lines print them (they belong to one game version).
+          // Test a hash in Video > Performance > Skip shaders first; when it removes only what the name says, add it here.
+          // A list with no hashes shows no row in the menu. Draws of these shaders are skipped, so never list one that builds
+          // a target the game keeps (terrain, the sky): those stay missing for good.
+          #pragma once
+          #include <stdint.h>
+
+          // Particles: Video > Performance > Particles (Normal / Low: half of the draws / Off). Each list ends with a 0.
+          static const uint64_t SG_PARTICLES[] = {0};
+          // Ambient effects: Video > Performance > Disable ambient effects
+          static const uint64_t SG_AMBIENT[] = {0};
+
+          // Named toggles, one row each under Skip shaders: label, what goes missing, up to 7 hashes (then a 0).
+          typedef struct { const char *label; const char *desc; uint64_t h[8]; } SgNamed;
+          static const SgNamed SG_NAMED[] = {
+              // {"Example effect", "What it removes.", {0x0123456789abcdefull}},
+              {NULL, NULL, {0}},
+          };
+          ''')
+
+          # ---- exec.c ---------------------------------------------------------------------------------------------------------
+          X = 'runtime/nvn/vulkan/exec.c'
+          edit(X, '        if (workers) n = atoi(workers);\n',
+               '        if (workers) n = atoi(workers);\n'
+               '#ifdef __ANDROID__\n'
+               '        else if (g_settings.shader_workers > 0) n = g_settings.shader_workers;  // (Video > Performance > CPU worker limit)\n'
+               '#endif\n')
+          PRIO = '''\
+          // Priority of the shader threads (Video > Performance > Shader compile priority): low 10, high -4 (the system may refuse
+          // a negative nice to an app: then they stay as they were)
+          #ifdef __ANDROID__
+          #include <sys/resource.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static void compile_thread_prio(void) {
+              int p = g_settings.compile_prio;
+              if (!p) return;
+              if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), p < 0 ? 10 : -4) != 0 && p > 0) {
+                  static bool said;
+                  if (!said) { said = true; LOG("[vk] shader priority high: the system refused it\\n"); }
+              }
+          }
+          #else
+          static void compile_thread_prio(void) {}
+          #endif
+          '''
+          edit(X, 'static void *worker(void *a) {\n    (void)a;\n',
+               PRIO + 'static void *worker(void *a) {\n    (void)a;\n    compile_thread_prio();\n')
+          edit(X, 'static void *translator(void *a) {\n    (void)a;\n',
+               'static void *translator(void *a) {\n    (void)a;\n    compile_thread_prio();\n')
+          edit(X, '        if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;\n',
+               '        if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;\n'
+               '#ifdef __ANDROID__\n'
+               '        else if (g_settings.vc_budget_mb > 0) b = (uint64_t)g_settings.vc_budget_mb << 20;  // (Video > Performance)\n'
+               '#endif\n')
+          SG = '''\
+          #ifdef __ANDROID__
+          #include "shader_groups.h"
+          static int sg_len(const uint64_t *a) { int n = 0; while (a[n]) n++; return n; }
+          static bool sg_has(const uint64_t *a, uint64_t h) { for (; *a; a++) if (*a == h) return true; return false; }
+          static int sg_named_n(void) { int n = 0; while (SG_NAMED[n].label) n++; return n; }
+          // what the menu (ui/menu.mm) asks: which rows to show, and what they say
+          int vk_group_count(int g) { return g == 0 ? sg_len(SG_PARTICLES) : sg_len(SG_AMBIENT); }  // 0 particles, 1 ambient
+          int vk_named_count(void) { int n = 0; for (int i = 0; i < sg_named_n() && i < 32; i++) if (SG_NAMED[i].h[0]) n++; return n; }
+          static const SgNamed *sg_named_at(int k) {  // the k-th named toggle that has hashes
+              for (int i = 0; i < sg_named_n() && i < 32; i++) if (SG_NAMED[i].h[0] && k-- == 0) return &SG_NAMED[i];
+              return NULL;
+          }
+          const char *vk_named_label(int k) { const SgNamed *s = sg_named_at(k); return s ? s->label : ""; }
+          const char *vk_named_desc(int k) { const SgNamed *s = sg_named_at(k); return s ? s->desc : ""; }
+          // the draw of this fragment shader is not made (the menu's toggles, checked as the draw starts)
+          static bool sg_skip(uint64_t h) {
+              int level = g_settings.particles;
+              if (level && sg_has(SG_PARTICLES, h)) {
+                  static uint64_t frame = ~0ull;
+                  static unsigned tick;
+                  uint64_t f = renderer_present_count();
+                  if (f != frame) { frame = f; tick = 0; }  // (the same draws are kept each frame: no shimmer)
+                  if (level >= 2 || (tick++ & 1)) return true;
+              }
+              if (g_settings.no_ambient && sg_has(SG_AMBIENT, h)) return true;
+              if (g_settings.skip_named) {
+                  int k = 0;
+                  for (int i = 0; i < sg_named_n() && i < 32; i++) {
+                      if (!SG_NAMED[i].h[0]) continue;
+                      if (((g_settings.skip_named >> k) & 1) && sg_has(SG_NAMED[i].h, h)) return true;
+                      k++;
+                  }
+              }
+              return false;
+          }
+          #endif
+          '''
+          edit(X, 'static uint64_t prof_tp_;\n', SG + 'static uint64_t prof_tp_;\n')
+          edit(X, '        if (g_settings.skip_grass && draw_is_grass(pr)) { stat_skipped++; return; }\n',
+               '        if (g_settings.skip_grass && draw_is_grass(pr)) { stat_skipped++; return; }\n'
+               '        if (sg_skip(last_hash)) { stat_skipped++; return; }\n')
+
+          # ---- the menu: Video > Performance, under Skip shaders -------------------------------------------------------------
+          M = 'runtime/ui/menu.mm'
+          edit(M, 'extern "C" bool vk_low_ram_auto(long *total_mb); // (what Automatic picks on this device)\n',
+               'extern "C" bool vk_low_ram_auto(long *total_mb); // (what Automatic picks on this device)\n'
+               'extern "C" int vk_group_count(int group);        // runtime/nvn/vulkan/exec.c, shader_groups.h: 0 particles, 1 ambient\n'
+               'extern "C" int vk_named_count(void);             // (named shader toggles that have hashes)\n'
+               'extern "C" const char *vk_named_label(int k);\n'
+               'extern "C" const char *vk_named_desc(int k);\n')
+          UI = '''\
+              {   // Particles, ambient effects and named shader toggles: a row shows once its list has hashes (shader_groups.h)
+                  if (vk_group_count(0) > 0) {
+                      static const char *pn[] = {"Off", "Low", "Normal"};
+                      int pi = 2 - g_settings.particles;
+                      if (opt_choice("Particles", &pi, pn, 3, 2,
+                                     "Normal: as the game draws them. Low: half of the particle draws. Off: none. Applies at once.", false)) {
+                          g_settings.particles = 2 - pi;
+                          settings_save();
+                      }
+                  }
+                  if (vk_group_count(1) > 0 &&
+                      opt_toggle("Disable ambient effects", &g_settings.no_ambient, false,
+                                 "Does not draw the small effects floating in the air. Applies at once."))
+                      settings_save();
+                  for (int i = 0; i < vk_named_count() && i < 32; i++) {
+                      bool on = (g_settings.skip_named >> i) & 1u;
+                      if (opt_toggle(vk_named_label(i), &on, false, vk_named_desc(i))) {
+                          g_settings.skip_named = on ? (g_settings.skip_named | (1u << i)) : (g_settings.skip_named & ~(1u << i));
+                          settings_save();
+                      }
+                  }
+              }
+              {
+                  bool fp = !g_settings.framepace_off;
+                  if (opt_toggle("Frame pacing", &fp, true,
+                                 "On: the runtime paces the frames at the chosen frame rate and keeps the game's clock steady. Off: the game's own "
+                                 "pacing and clock (30 fps, 20 when slow); the frame rate setting stops applying. Restart the game."))
+                      { g_settings.framepace_off = !fp; settings_save(); }
+                  float sw = (float)g_settings.shader_workers;
+                  if (opt_slider("CPU worker limit", &sw, 0, 4, 1, 0, "%.0f",
+                                 "Threads that compile shaders (0: Automatic, up to 4). Fewer leaves CPU to the game, but a new area stays choppy "
+                                 "longer. The game's own job threads are not touched. Restart the game.")) {
+                      g_settings.shader_workers = (int)(sw + 0.5f);
+                      settings_save();
+                  }
+                  static const char *cp[] = {"Low", "Normal", "High"};
+                  int ci = g_settings.compile_prio + 1;
+                  if (opt_choice("Shader compile priority", &ci, cp, 3, 1,
+                                 "Low: the compile threads yield to the game. High: they ask the system for more CPU time (it may refuse). "
+                                 "Restart the game.", false)) {
+                      g_settings.compile_prio = ci - 1;
+                      settings_save();
+                  }
+                  float vb = (float)g_settings.vc_budget_mb;
+                  if (opt_slider("Geometry cache budget", &vb, 0, 1536, 64, 0, "%.0f MB",
+                                 "GPU memory for the game's vertex and index data (0: Automatic, 768 MB, less on 4 GB phones). Lower saves "
+                                 "memory but copies more. Not textures: their size is Texture quality. Restart the game.")) {
+                      g_settings.vc_budget_mb = (int)(vb + 0.5f);
+                      settings_save();
+                  }
+              }
+          '''
+          edit(M, '"A wrong one can hide things: clear the box to undo. Applies within a second.")) settings_save();\n',
+               '"A wrong one can hide things: clear the box to undo. Applies within a second.")) settings_save();\n' + UI)
+          print('extra toggles applied')
+          PY_EXTRA
+          python3 /tmp/extra_toggles.py
+          git diff --stat
+
+      - name: Apply requested performance options (effects, geometry, textures, render distance, limiter, pacing, dynamic resolution)
+        run: |
+          cat > /tmp/round2.py <<'PY_ROUND2'
+          # Round 2 of the performance options, applied after the "extra performance toggles" step. Run from the repository root.
+          #   particles / environmental effects  the existing rows now always show, and also work by how a draw is made (no hashes needed)
+          #   geometry detail                    instanced draws thinned
+          #   texture memory budget              a cap on the size of compressed textures
+          #   geometry cache                     aggressive budget
+          #   render distance                    the main camera's far plane (1.8.2 and later)
+          #   FPS limiter, frame pacing modes    framepace.c / nvn/objects.c
+          #   dynamic resolution                 a toggle with a floor and a target frame rate
+          #   CPU worker limit                   Automatic / 1 / 2 / 3 / 4
+          #   performance experiments            one preset row over the risky ones
+          import sys
+
+
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+
+          # ---- settings ---------------------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', '    bool vk_prof;',
+               r'''    int geo_detail;       // Video > Performance > Geometry detail: 0 Normal, 1 Reduced, 2 Low (instanced draws thinned: exec.c geo_thin_inst)
+              int tex_cap;          // Texture memory budget: the largest side of a compressed texture, px (0: no cap, 1024 / 512 / 256); textures.c
+              bool vc_aggressive;   // Geometry cache: an aggressive budget (128..256 MB); read when the game starts (exec.c vc_budget)
+              int render_dist;      // Render distance: 0 Normal, 1 75%, 2 50%, 3 30% of the main camera's far plane (hle/widescreen.c; 1.8.2 and later)
+              int fps_limit;        // FPS limiter: 0 off, else at most this many fps (hle/framepace.c framepace_target)
+              int pace_mode;        // Frame pacing mode: 0 Smooth, 1 Strict grid, 2 Unpaced (nvn/objects.c, the present)
+              int dyn_min;          // Dynamic resolution's floor, % of Match display (0: 50)
+              int dyn_target;       // the frame rate Dynamic resolution holds: 0 the Frame rate setting's, else 30 / 45 / 60
+              bool vk_prof;''')
+
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n' + r'''        else if (!strcmp(key, "geo_detail")) { int v = atoi(val); g_settings.geo_detail = v < 0 ? 0 : v > 2 ? 2 : v; }
+                  else if (!strcmp(key, "tex_cap")) { int v = atoi(val); g_settings.tex_cap = v == 256 || v == 512 || v == 1024 ? v : 0; }
+                  else if (!strcmp(key, "vc_aggressive")) g_settings.vc_aggressive = atoi(val) != 0;
+                  else if (!strcmp(key, "render_dist")) { int v = atoi(val); g_settings.render_dist = v < 0 ? 0 : v > 3 ? 3 : v; }
+                  else if (!strcmp(key, "fps_limit")) { int v = atoi(val); g_settings.fps_limit = v < 15 ? 0 : v > 240 ? 240 : v; }
+                  else if (!strcmp(key, "pace_mode")) { int v = atoi(val); g_settings.pace_mode = v < 0 ? 0 : v > 2 ? 2 : v; }
+                  else if (!strcmp(key, "dyn_min")) { int v = atoi(val); g_settings.dyn_min = v < 25 || v > 90 ? 0 : v; }
+                  else if (!strcmp(key, "dyn_target")) { int v = atoi(val); g_settings.dyn_target = v == 30 || v == 45 || v == 60 ? v : 0; }
+          ''')
+          edit('runtime/settings.c',
+               '            g_settings.shader_workers, g_settings.compile_prio);\n',
+               '            g_settings.shader_workers, g_settings.compile_prio);\n' + r'''    fprintf(f, "geo_detail = %d\ntex_cap = %d\nvc_aggressive = %d\nrender_dist = %d\n", g_settings.geo_detail,
+                      g_settings.tex_cap, g_settings.vc_aggressive, g_settings.render_dist);
+              fprintf(f, "fps_limit = %d\npace_mode = %d\ndyn_min = %d\ndyn_target = %d\n", g_settings.fps_limit, g_settings.pace_mode,
+                      g_settings.dyn_min, g_settings.dyn_target);
+          ''')
+          edit('runtime/settings.c',
+               '    g_settings.compile_prio = d->compile_prio;\n',
+               '    g_settings.compile_prio = d->compile_prio;\n' + r'''    g_settings.geo_detail = d->geo_detail;
+              g_settings.tex_cap = d->tex_cap;
+              g_settings.vc_aggressive = d->vc_aggressive;
+              g_settings.render_dist = d->render_dist;
+              g_settings.fps_limit = d->fps_limit;
+              g_settings.pace_mode = d->pace_mode;
+              g_settings.dyn_min = d->dyn_min;
+              g_settings.dyn_target = d->dyn_target;
+          ''')
+
+          # ---- FPS limiter ------------------------------------------------------------------------------------------------------
+          edit('runtime/hle/framepace.c',
+               '    if (ev > 0 && (fps == 0 || fps > ev) && in_event()) fps = ev;\n    return fps;\n',
+               '    if (ev > 0 && (fps == 0 || fps > ev) && in_event()) fps = ev;\n' + r'''#ifdef __ANDROID__
+              // Video > Performance > FPS limiter: never above this (the Frame rate setting's pace otherwise; the runtime's pacing must be on)
+              if (g_settings.fps_limit > 0 && (fps == 0 || fps > g_settings.fps_limit)) fps = g_settings.fps_limit;
+          #endif
+              return fps;
+          ''')
+
+          # ---- frame pacing modes -----------------------------------------------------------------------------------------------
+          O = 'runtime/nvn/objects.c'
+          edit(O,
+               '            static bool stuck;\n'
+               '            uint64_t period = framepace_period_ns(), target = last + period, t0 = plat_now_ns();\n'
+               '            if (last && t0 < target) plat_sleep_until_ns(target);\n',
+               r'''            static bool stuck;
+                      // Video > Performance > Frame pacing mode: 0 Smooth (this grid, its phase held to the display's), 1 Strict grid
+                      // (the grid, its phase left alone), 2 Unpaced (no wait for the grid: the game's clock still follows the real frames)
+                      int pmode = 0;
+          #ifdef __ANDROID__
+                      pmode = g_settings.pace_mode;
+          #endif
+                      uint64_t period = framepace_period_ns(), target = last + period, t0 = plat_now_ns();
+                      if (last && t0 < target && pmode != 2) plat_sleep_until_ns(target);
+          ''')
+          edit(O, '            bool on_grid = last && t1 < target + period;\n',
+               '            bool on_grid = last && t1 < target + period && pmode != 2;\n')
+          edit(O, '            if (backend_vsync_offset(last + period, period, &off, &vp)) {\n',
+               '            if (pmode == 0 && backend_vsync_offset(last + period, period, &off, &vp)) {\n')
+
+          # ---- dynamic resolution: a floor and a target -------------------------------------------------------------------------
+          S = 'runtime/nvn/output_scale.c'
+          edit(S, 'static void dyn_update(double now, double gpu_ms) {\n',
+               r'''// Video > Performance > Dynamic resolution floor (% of Match display; 0: 50)
+          static double dyn_floor(void) {
+          #ifdef __ANDROID__
+              int m = g_settings.dyn_min;
+              if (m >= 25 && m <= 90) return m / 100.0;
+          #endif
+              return 0.5;
+          }
+
+          static void dyn_update(double now, double gpu_ms) {
+          ''')
+          edit(S, '    g_dyn_dt_sum += dt;\n    g_dyn_n++;\n',
+               r'''#ifdef __ANDROID__
+              // the frame rate it holds: the setting's own (Video > Performance > Dynamic resolution target), and never above the FPS limiter
+              if (g_settings.dyn_target > 0) want = 1000.0 / g_settings.dyn_target;
+              if (g_settings.fps_limit > 0 && want < 1000.0 / g_settings.fps_limit) want = 1000.0 / g_settings.fps_limit;
+          #endif
+              g_dyn_dt_sum += dt;
+              g_dyn_n++;
+          ''')
+          edit(S, '        g_dyn = fmax(0.5, g_dyn - (avg_dt > want * 1.3 ? 0.1 : 0.05));\n',
+               '        g_dyn = fmax(dyn_floor(), g_dyn - (avg_dt > want * 1.3 ? 0.1 : 0.05));\n')
+          edit(S, '    g_dyn = round(g_dyn * 20) / 20;\n',
+               '    if (g_dyn < dyn_floor()) g_dyn = dyn_floor();  // (the floor was raised)\n    g_dyn = round(g_dyn * 20) / 20;\n')
+
+          # ---- texture memory budget --------------------------------------------------------------------------------------------
+          edit('runtime/nvn/vulkan/textures.c',
+               '            tw >>= 1, th >>= 1, levels--, b->skip = 1;\n        }\n',
+               '            tw >>= 1, th >>= 1, levels--, b->skip = 1;\n        }\n' + r'''#ifdef __ANDROID__
+                  {   // Video > Performance > Texture memory budget: no compressed texture the game only samples is bigger than this
+                      // on a side - more of its top levels left out (a quarter of the memory for each), at most three, never below 64 px
+                      int cap = g_settings.tex_cap;
+                      if (cap > 0 && compressed && !depthfmt && b->rs_group == RS_NONE && !(t->flags & (8 | 0x50)) &&
+                          type == VK_IMAGE_TYPE_2D && samples == 1) {
+                          while (b->skip < 3 && levels >= 2 && (uint32_t)t->layout.levels > b->skip + 1u && (tw > (uint32_t)cap || th > (uint32_t)cap) &&
+                                 (tw >> 1) >= 64 && (th >> 1) >= 64) {
+                              tw >>= 1, th >>= 1, levels--, b->skip++;
+                          }
+                      }
+                  }
+          #endif
+          ''')
+
+          # ---- exec.c: effects found by how they are drawn, geometry detail, the aggressive cache ---------------------------------
+          X = 'runtime/nvn/vulkan/exec.c'
+          FX = r'''#ifdef __ANDROID__
+          // Particles and environmental effects found by how they are drawn, with no shader hashes (Video > Performance > Particle
+          // effects, Disable environmental effects; the lists in shader_groups.h add to this). Both are transparent: in a pass with
+          // a depth buffer, blended into target 0, depth tested but never written, no stencil.
+          //   particles       additive blending (sparks, fire, glows, magic)
+          //   environmental   alpha blending of an instanced draw, eight instances or more (rain, snow, dust, leaves, motes)
+          // A guess: it can also take a glow that is not a particle. Applies at once.
+          static bool fx_heuristic(uint32_t ninst) {
+              int level = g_settings.particles;
+              bool env = g_settings.no_ambient;
+              if (!level && !env) return false;
+              if (!st.rt.depth || st.rt.ncolor < 1 || !(st.color_state[0] & 1)) return false;
+              if (!st.ds[0] || st.ds[1] || st.ds[3]) return false;
+              const uint8_t *b = st.blend[0];  // (target, srcC, dstC, srcA, dstA, eqC, eqA)
+              if (b[5] != 1) return false;     // (add)
+              bool additive = b[2] == 2 && (b[1] == 2 || b[1] == 5);
+              bool soft = b[1] == 5 && b[2] == 6 && ninst >= 8;
+              if (additive && level) {
+                  if (level >= 2) return true;
+                  static uint64_t frame = ~0ull;
+                  static unsigned tick;
+                  uint64_t f = renderer_present_count();
+                  if (f != frame) { frame = f; tick = 0; }  // (the same draws are kept each frame: no shimmer)
+                  return (tick++ & 1) != 0;
+              }
+              return soft && env;
+          }
+          // Video > Performance > Geometry detail: an instanced draw (grass, rocks, foliage, particles) draws fewer instances: 3 in 4
+          // (Reduced) or 1 in 2 (Low), never under 8; draws of fewer than 16 are left as they are
+          static uint32_t geo_thin_inst(uint32_t n) {
+              int lv = g_settings.geo_detail;
+              if (lv <= 0 || n < 16) return n;
+              uint32_t k = lv == 1 ? n - n / 4 : n / 2;
+              return k < 8 ? 8 : k;
+          }
+          #else
+          static bool fx_heuristic(uint32_t ninst) { (void)ninst; return false; }
+          static uint32_t geo_thin_inst(uint32_t n) { return n; }
+          #endif
+          '''
+          edit(X, 'static uint64_t prof_tp_;\n', FX + 'static uint64_t prof_tp_;\n')
+          edit(X, '        if (sg_skip(last_hash)) { stat_skipped++; return; }\n',
+               '        if (sg_skip(last_hash)) { stat_skipped++; return; }\n'
+               '        if (fx_heuristic(indexed ? (uint32_t)r->x[6] : (uint32_t)r->x[4])) { stat_skipped++; return; }\n')
+          edit(X, 'inst = (uint32_t)r->x[4] ? (uint32_t)r->x[4] : 1;\n',
+               'inst = geo_thin_inst((uint32_t)r->x[4] ? (uint32_t)r->x[4] : 1);\n')
+          edit(X, 'inst = (uint32_t)r->x[6] ? (uint32_t)r->x[6] : 1;\n',
+               'inst = geo_thin_inst((uint32_t)r->x[6] ? (uint32_t)r->x[6] : 1);\n')
+          edit(X, '        LOG("[vk] buffer cache: up to',
+               r'''#ifdef __ANDROID__
+                  if (g_settings.vc_aggressive) {  // (Video > Performance > Geometry cache: a sixteenth of the RAM, 128 to 256 MB, if that is less)
+                      uint64_t a = total_kb ? (uint64_t)total_kb * 1024 / 16 : (256ull << 20);
+                      if (a > (256ull << 20)) a = 256ull << 20;
+                      if (a < (128ull << 20)) a = 128ull << 20;
+                      if (a < b) b = a;
+                  }
+          #endif
+                  LOG("[vk] buffer cache: up to''')
+
+          # ---- render distance (1.8.2 and later: the hooked build) --------------------------------------------------------------
+          edit('runtime/hle/widescreen.c',
+               'void rt_persp_update(uint64_t proj) {\n    g_hooked = true;\n',
+               r'''#ifdef __ANDROID__
+          // Video > Performance > Render distance: the main camera's far plane (a projection with near 1 and far 25000 - found as
+          // the widescreen code finds it) at 75%, 50% or 30%, never under 3000. The game's own culling follows its frustum. The
+          // first far plane seen stays the original, so Normal puts it back at the next rebuild.
+          static void persp_far_limit(uint64_t proj) {
+              static const float share[4] = {1.0f, 0.75f, 0.5f, 0.3f};
+              static struct { uint64_t proj; float orig; } seen[16];
+              static int nseen;
+              int lv = g_settings.render_dist;
+              if (lv < 0 || lv > 3) lv = 0;
+              float *p = (float *)(uintptr_t)(proj + 0x98);  // near, far, fovy
+              int k = -1;
+              for (int i = 0; i < nseen; i++) if (seen[i].proj == proj) { k = i; break; }
+              if (k < 0) {
+                  if (!lv || nseen == 16) return;
+                  if (!(p[0] > 0.0f && p[0] <= 5.0f && p[1] >= 10000.0f && p[1] <= 200000.0f)) return;
+                  seen[nseen].proj = proj, seen[nseen].orig = p[1], k = nseen++;
+              }
+              float f = lv ? seen[k].orig * share[lv] : seen[k].orig;
+              if (f < 3000.0f) f = 3000.0f;
+              if (p[1] != f) {
+                  p[1] = f;
+                  LOG("[widescreen] render distance %d: far plane %.0f\n", lv, f);
+              }
+          }
+          #endif
+          void rt_persp_update(uint64_t proj) {
+              g_hooked = true;
+          #ifdef __ANDROID__
+              if (proj) persp_far_limit(proj);
+          #endif
+          ''')
+
+          # ---- the menu ---------------------------------------------------------------------------------------------------------
+          M = 'runtime/ui/menu.mm'
+          # particles and environmental effects: the rows always show (they work without hashes now)
+          edit(M, '        if (vk_group_count(0) > 0) {\n            static const char *pn[] = {"Off", "Low", "Normal"};\n',
+               '        {\n            static const char *pn[] = {"Off", "Low", "Normal"};\n')
+          edit(M, '            if (opt_choice("Particles", &pi, pn, 3, 2,\n'
+                  '                           "Normal: as the game draws them. Low: half of the particle draws. Off: none. Applies at once.", false)) {\n',
+               '            if (opt_choice("Particle effects", &pi, pn, 3, 2,\n'
+               '                           "Sparks, fire, glows and magic, found by how they are drawn (additive blending), and any shader listed for "\n'
+               '                           "them. Normal: as the game draws them. Low: half of the draws. Off: none. A guess: it can take a glow that "\n'
+               '                           "is not a particle. Applies at once.", false)) {\n')
+          edit(M, '        if (vk_group_count(1) > 0 &&\n            opt_toggle("Disable ambient effects", &g_settings.no_ambient, false,\n'
+                  '                       "Does not draw the small effects floating in the air. Applies at once."))\n',
+               '        if (opt_toggle("Disable environmental effects", &g_settings.no_ambient, false,\n'
+               '                       "Does not draw the effects in the air: rain, snow, dust, leaves and motes (found as alpha-blended draws of "\n'
+               '                       "eight or more instances), and any shader listed for them. A guess. Applies at once."))\n')
+          # CPU worker limit: Automatic / 1 / 2 / 3 / 4
+          edit(M, '        float sw = (float)g_settings.shader_workers;\n'
+                  '        if (opt_slider("CPU worker limit", &sw, 0, 4, 1, 0, "%.0f",\n'
+                  '                       "Threads that compile shaders (0: Automatic, up to 4). Fewer leaves CPU to the game, but a new area stays choppy "\n'
+                  '                       "longer. The game\'s own job threads are not touched. Restart the game.")) {\n'
+                  '            g_settings.shader_workers = (int)(sw + 0.5f);\n'
+                  '            settings_save();\n'
+                  '        }\n',
+               '        {\n'
+               '            static const char *cw[] = {"Automatic", "1", "2", "3", "4"};\n'
+               '            int wi = g_settings.shader_workers < 0 ? 0 : g_settings.shader_workers > 4 ? 4 : g_settings.shader_workers;\n'
+               '            if (opt_choice("CPU worker limit", &wi, cw, 5, 0,\n'
+               '                           "How many threads compile shaders: Automatic, or 1 to 4. Fewer leaves CPU to the game, but a new area stays "\n'
+               '                           "choppy longer. The game\'s own job threads are not touched. Restart the game.")) {\n'
+               '                g_settings.shader_workers = wi;\n'
+               '                settings_save();\n'
+               '            }\n'
+               '        }\n')
+
+          UI = r'''    opt_section("Frame rate tools");
+              {
+                  static const char *fl[] = {"Off", "20 fps", "25 fps", "30 fps", "40 fps", "45 fps", "50 fps", "60 fps"};
+                  static const int fl_v[] = {0, 20, 25, 30, 40, 45, 50, 60};
+                  int li = 0;
+                  for (int i = 0; i < 8; i++) if (fl_v[i] <= g_settings.fps_limit) li = i;
+                  if (g_settings.framepace_off) opt_disable_next();
+                  if (opt_choice("FPS limiter", &li, fl, 8, 0,
+                                 "The game never runs above this, whatever the Frame rate setting (it is the lower of the two). 25 and 50 do not "
+                                 "divide a 60 Hz screen evenly: they can look uneven. Needs Frame pacing on. Applies at once.")) {
+                      g_settings.fps_limit = fl_v[li];
+                      settings_save();
+                  }
+                  static const char *pm[] = {"Smooth", "Strict grid", "Unpaced"};
+                  if (g_settings.framepace_off) opt_disable_next();
+                  if (opt_choice("Frame pacing mode", &g_settings.pace_mode, pm, 3, 0,
+                                 "Smooth: frames on a steady grid, its phase held to the screen's refresh (the default). Strict grid: the same "
+                                 "grid, its phase left alone - try it if frames go out uneven. Unpaced: no wait for the grid, so no frame rate "
+                                 "limit and the FPS limiter stops applying: the game's clock still follows the real frames, but the phone works "
+                                 "flat out and heats. For tests. Applies at once.", false))
+                      settings_save();
+                  bool dyn = g_settings.res_mode == RES_DYNAMIC;
+                  if (opt_toggle("Dynamic resolution", &dyn, false,
+                                 "The same as Internal resolution: Dynamic. The 3D image's size follows the GPU: lower when it cannot hold the frame "
+                                 "rate, higher when it has room. Off goes back to Match display. Applies at once.")) {
+                      g_settings.res_mode = dyn ? RES_DYNAMIC : RES_MATCH;
+                      settings_save();
+                  }
+                  if (!dyn) opt_disable_next();
+                  int dm = g_settings.dyn_min ? g_settings.dyn_min : 50;
+                  if (opt_int("Dynamic resolution floor", &dm, 25, 90, 5, 50, "%d%%",
+                              "The lowest share of the display's resolution Dynamic resolution goes down to. Lower holds the frame rate on weaker "
+                              "GPUs; the image gets softer. Applies at once.")) {
+                      g_settings.dyn_min = dm == 50 ? 0 : dm;
+                      settings_save();
+                  }
+                  static const char *dt[] = {"Frame rate setting", "30 fps", "45 fps", "60 fps"};
+                  static const int dt_v[] = {0, 30, 45, 60};
+                  int di = 0;
+                  for (int i = 0; i < 4; i++) if (dt_v[i] == g_settings.dyn_target) di = i;
+                  if (!dyn) opt_disable_next();
+                  if (opt_choice("Dynamic resolution target", &di, dt, 4, 0,
+                                 "The frame rate Dynamic resolution holds. Frame rate setting: as the Frame rate row (30 unless that is 60 or 40 / 45). "
+                                 "Applies at once.")) {
+                      g_settings.dyn_target = dt_v[di];
+                      settings_save();
+                  }
+              }
+              opt_section("Performance experiments");
+              {   // one preset over the risky ones (each below can be set on its own: the preset then shows Custom)
+                  static const char *xn[] = {"Custom", "Off", "Light", "Heavy"};
+                  static const int xv[4][6] = {{0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}, {1, 0, 1, 1024, 0, 0}, {2, 1, 2, 512, 1, 1}};
+                  // particles, environmental effects, geometry detail, texture budget, aggressive cache, render distance
+                  int cur = 0;
+                  for (int p = 1; p < 4; p++)
+                      if (g_settings.particles == xv[p][0] && g_settings.no_ambient == (xv[p][1] != 0) && g_settings.geo_detail == xv[p][2] &&
+                          g_settings.tex_cap == xv[p][3] && g_settings.vc_aggressive == (xv[p][4] != 0) && g_settings.render_dist == xv[p][5]) cur = p;
+                  int xi = cur;
+                  if (opt_choice("Experiments preset", &xi, xn, 4, 1,
+                                 "Off: none. Light: half the particles, 3 in 4 instances, textures up to 1024 px. Heavy: no particles or "
+                                 "environmental effects, half the instances, textures up to 512 px, the small geometry cache, 75% render distance. "
+                                 "Experimental: things can go missing or look wrong. Some apply when the game restarts.", false) && xi > 0 && xi != cur) {
+                      g_settings.particles = xv[xi][0];
+                      g_settings.no_ambient = xv[xi][1] != 0;
+                      g_settings.geo_detail = xv[xi][2];
+                      g_settings.tex_cap = xv[xi][3];
+                      g_settings.vc_aggressive = xv[xi][4] != 0;
+                      g_settings.render_dist = xv[xi][5];
+                      settings_save();
+                  }
+              }
+              {
+                  static const char *gd[] = {"Normal", "Reduced", "Low"};
+                  if (opt_choice("Geometry detail", &g_settings.geo_detail, gd, 3, 0,
+                                 "Draws fewer instances of what the game draws in numbers (grass, rocks, foliage, particles): Reduced 3 in 4, Low "
+                                 "1 in 2. Less vertex work; plants and clutter get thinner and can pop. Applies at once.", false))
+                      settings_save();
+                  static const char *tb[] = {"No cap", "1024 px", "512 px", "256 px"};
+                  static const int tb_v[] = {0, 1024, 512, 256};
+                  int ti = 0;
+                  for (int i = 0; i < 4; i++) if (tb_v[i] == g_settings.tex_cap) ti = i;
+                  if (opt_choice("Texture memory budget", &ti, tb, 4, 0,
+                                 "No colour texture is bigger than this on a side: bigger ones start at a smaller level, a quarter of the memory per "
+                                 "step. It adds to Texture quality. Only compressed textures the game samples. Textures made from now on: restart "
+                                 "the game.", false)) {
+                      g_settings.tex_cap = tb_v[ti];
+                      settings_save();
+                  }
+                  bool ca = g_settings.vc_aggressive;
+                  if (opt_toggle("Aggressive geometry cache", &ca, false,
+                                 "A small cache for the game's vertex and index data (a sixteenth of the RAM, 128 to 256 MB, whichever is less than "
+                                 "the budget above): less GPU memory, more copying. Restart the game.")) {
+                      g_settings.vc_aggressive = ca;
+                      settings_save();
+                  }
+                  extern int g_game_version;
+                  static const char *rd[] = {"Normal", "75%", "50%", "30%"};
+                  if (g_game_version != 0 && g_game_version < 182) opt_disable_next();
+                  if (opt_choice("Render distance", &g_settings.render_dist, rd, 4, 0,
+                                 "Shortens the main camera's far plane, and the game's culling with it. Game versions 1.8.2 and 1.9.0 only. The "
+                                 "far plane is very long, so a little may change, and far mountains or the sky can go missing at 30%. Applies as "
+                                 "the camera is rebuilt, within a moment.", false))
+                      settings_save();
+              }
+          '''
+          edit(M, '            g_settings.vc_budget_mb = (int)(vb + 0.5f);\n            settings_save();\n        }\n    }\n#endif\n',
+               '            g_settings.vc_budget_mb = (int)(vb + 0.5f);\n            settings_save();\n        }\n    }\n' + UI + '#endif\n')
+          print('round 2 applied')
+          PY_ROUND2
+          python3 /tmp/round2.py
+          git diff --stat
+
+      - name: Apply the Dimensity 9000 CPU profile (render thread on the fast cores, utilization floor, resident code)
+        run: |
+          cat > runtime/d9000_perf.h <<'D9_H_EOF'
+          // Dimensity 9000 (MT6983) CPU profile (runtime/d9000_perf.c), adapted from the Helio G95 fork's g95_perf.c.
+          // Every call is a no-op on other SoCs, and on desktop builds.
+          #pragma once
+          #include <stdbool.h>
+          #include <stdint.h>
+
+          #ifdef __ANDROID__
+          bool d9_on(void);
+          bool d9_pin_render_thread(void);                   // the render thread -> the X2 + A710 cores (platform/android.c)
+          void d9_uclamp_thread(void);                       // a utilization floor for the calling thread
+          void d9_keep_resident(uint64_t lo, uint64_t size); // madvise WILLNEED the game's code and the runtime's tables
+          #else
+          static inline bool d9_on(void) { return false; }
+          static inline bool d9_pin_render_thread(void) { return false; }
+          static inline void d9_uclamp_thread(void) {}
+          static inline void d9_keep_resident(uint64_t lo, uint64_t size) { (void)lo; (void)size; }
+          #endif
+          D9_H_EOF
+          cat > runtime/d9000_perf.c <<'D9_C_EOF'
+          // Device-specific CPU profile: MediaTek Dimensity 9000 (MT6983), Mali-G710 MC10 (OnePlus Pad and similar).
+          // Adapted from the Helio G95 fork's g95_perf.c (same idea, this SoC's layout); CPU scheduling only, no rendering change.
+          //
+          //   1 x Cortex-X2 (~3.05 GHz), 3 x Cortex-A710 (~2.85 GHz), 4 x Cortex-A510 (~1.8 GHz).
+          //
+          // What it does (everything is off with LARECOMP_NO_D9000=1; LARECOMP_FORCE_D9000=1 turns it on for another SoC):
+          //   - finds the fast cores at run time from /sys: every CPU whose top speed is at least 70% of the best CPU's
+          //     (cpuinfo_max_freq, or cpu_capacity if that is unreadable) - the X2 and the three A710s, not the A510s;
+          //   - pins the render thread (the command-list translator) to those cores, so it cannot land on an A510;
+          //   - sets a utilization floor (uclamp.min, default 384 of 1024, LARECOMP_UCLAMP_MIN overrides) for every thread the
+          //     runtime starts, so the governor does not idle the cores between frames;
+          //   - advises the kernel to keep the game's code and the runtime's tables resident (madvise WILLNEED).
+          // Every step logs a [d9000] line, and a refusal by the kernel only means stock behavior.
+
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <sched.h>
+          #include <stdatomic.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <strings.h>
+          #include <sys/mman.h>
+          #include <sys/syscall.h>
+          #include <sys/system_properties.h>
+          #include <unistd.h>
+
+          #include "rt.h"
+          #include "d9000_perf.h"
+
+          #ifdef __ANDROID__
+
+          #define D9_MAX_CPUS 16
+
+          typedef struct {
+              int detected;            // -1 not checked, 0 not this SoC (or no clusters), 1 yes
+              int fast_cpu[D9_MAX_CPUS];
+              int nfast;
+              long top, slowest_fast;
+          } D9Profile;
+
+          static D9Profile g_d9 = {.detected = -1};
+
+          static bool d9_board_is_mt6983(void) {
+              if (getenv("LARECOMP_FORCE_D9000")) return true;
+              char buf[PROP_VALUE_MAX];
+              const char *keys[] = {"ro.board.platform", "ro.mediatek.platform", "ro.soc.model", "ro.hardware", NULL};
+              for (int i = 0; keys[i]; i++) {
+                  if (__system_property_get(keys[i], buf) <= 0) continue;
+                  if (!strncasecmp(buf, "mt6983", 6)) return true;
+              }
+              return false;
+          }
+
+          static long d9_read_long(const char *path) {
+              FILE *f = fopen(path, "re");
+              if (!f) return -1;
+              long v = -1;
+              if (fscanf(f, "%ld", &v) != 1) v = -1;
+              fclose(f);
+              return v;
+          }
+
+          static void d9_find_clusters(D9Profile *p) {
+              long val[D9_MAX_CPUS] = {0};
+              int n = 0;
+              for (int c = 0; c < D9_MAX_CPUS; c++) {
+                  char path[96];
+                  snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+                  long v = d9_read_long(path);
+                  if (v <= 0) {
+                      snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+                      v = d9_read_long(path);
+                  }
+                  if (v <= 0) break;  // (no such CPU, or nothing readable: the end of the list)
+                  val[c] = v, n = c + 1;
+              }
+              for (int c = 0; c < n; c++)
+                  if (val[c] > p->top) p->top = val[c];
+              if (p->top <= 0 || n == 0) return;
+              p->slowest_fast = p->top;
+              for (int c = 0; c < n; c++) {
+                  if (val[c] * 100 >= p->top * 70) {
+                      p->fast_cpu[p->nfast++] = c;
+                      if (val[c] < p->slowest_fast) p->slowest_fast = val[c];
+                  }
+              }
+              if (p->nfast == 0 || p->nfast == n) p->nfast = 0;  // (one cluster: nothing to pin to)
+          }
+
+          static const D9Profile *d9_profile(void) {
+              if (g_d9.detected < 0) {
+                  g_d9.detected = 0;
+                  if (d9_board_is_mt6983()) {
+                      d9_find_clusters(&g_d9);
+                      if (g_d9.nfast > 0) g_d9.detected = 1;
+                  }
+                  LOG("[d9000] %s: %d fast core%s (top %ld, slowest fast %ld)\n",
+                      g_d9.detected == 1 ? "Dimensity 9000 profile on" : "not a Dimensity 9000, or no clusters readable: stock behavior",
+                      g_d9.nfast, g_d9.nfast == 1 ? "" : "s", g_d9.top, g_d9.slowest_fast);
+              }
+              return &g_d9;
+          }
+
+          bool d9_on(void) { return d9_profile()->detected == 1 && getenv("LARECOMP_NO_D9000") == NULL; }
+
+          static bool d9_set_uclamp_min(int want, const char *what) {
+              struct {
+                  uint32_t size, policy;
+                  uint64_t flags;
+                  int32_t nice;
+                  uint32_t priority;
+                  uint64_t runtime, deadline, period;
+                  uint32_t util_min, util_max;
+              } attr = {.size = 56, .flags = 0x08 | 0x10 | 0x20, .util_min = (uint32_t)want};  // (KEEP_POLICY | KEEP_PARAMS | UTIL_CLAMP_MIN)
+              long r = syscall(__NR_sched_setattr, 0, &attr, 0);
+              static atomic_int logged;
+              if (!atomic_exchange(&logged, 1)) LOG("[d9000] uclamp.min %d (%s): %s\n", want, what, r ? strerror(errno) : "ok");
+              return r == 0;
+          }
+
+          bool d9_pin_render_thread(void) {
+              if (!d9_on()) return false;
+              const D9Profile *p = d9_profile();
+              cpu_set_t set;
+              CPU_ZERO(&set);
+              for (int i = 0; i < p->nfast; i++) CPU_SET(p->fast_cpu[i], &set);
+              int r = sched_setaffinity(0, sizeof set, &set);
+              static atomic_int logged;
+              if (!atomic_exchange(&logged, 1))
+                  LOG("[d9000] render thread on the %d fast core%s: %s\n", p->nfast, p->nfast == 1 ? "" : "s", r ? strerror(errno) : "ok");
+              return r == 0;
+          }
+
+          void d9_uclamp_thread(void) {
+              if (!d9_on()) return;
+              if (getenv("LARECOMP_UCLAMP_MIN")) return;  // (the stock experiment's own setting wins: platform/android.c)
+              d9_set_uclamp_min(384, "the Dimensity 9000 profile");
+          }
+
+          void d9_keep_resident(uint64_t lo, uint64_t size) {
+              if (!d9_on()) return;
+              static uint64_t advised_hi;
+              uint64_t hi = lo + size;
+              if (lo < advised_hi) lo = advised_hi;
+              if (hi <= advised_hi) return;
+              advised_hi = hi;
+              madvise((void *)(uintptr_t)lo, hi - lo, MADV_WILLNEED);
+              LOG("[d9000] code and tables kept resident: %llx..%llx (%llu MB)\n", (unsigned long long)lo, (unsigned long long)hi,
+                  (unsigned long long)((hi - lo) >> 20));
+          }
+
+          #endif  // __ANDROID__
+          D9_C_EOF
+          cat > /tmp/d9_hooks.py <<'D9_PY_EOF'
+          def once(s, old, new):
+              assert s.count(old) == 1, "anchor not found exactly once: " + old[:70]
+              return s.replace(old, new)
+
+          p = "runtime/platform/android.c"
+          s = open(p, encoding="utf-8").read()
+          s = once(s, '#include "../platform.h"\n', '#include "../platform.h"\n#include "../d9000_perf.h"\n')
+          s = once(s, 'void plat_render_thread_pin(void) {\n',
+                   'void plat_render_thread_pin(void) {\n    if (d9_pin_render_thread()) return;  // (Dimensity 9000 profile: runtime/d9000_perf.c)\n')
+          s = once(s, 'void plat_thread_unpin(void) {\n    if (g_pinned) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);\n    uclamp_min_thread();\n',
+                   'void plat_thread_unpin(void) {\n    if (g_pinned) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);\n    uclamp_min_thread();\n    d9_uclamp_thread();  // (Dimensity 9000 profile)\n')
+          open(p, "w", encoding="utf-8").write(s)
+
+          p = "runtime/native.c"
+          s = open(p, encoding="utf-8").read()
+          s = once(s, '#include "settings.h"\n', '#include "settings.h"\n#include "d9000_perf.h"\n')
+          a = "        FATAL(\"[native] %s: the code can't be made executable (errno %d)\\n\", m->name, errno);\n"
+          s = once(s, a, a + "    d9_keep_resident(t0, tsz);      // (Dimensity 9000 profile: the game's code stays resident)\n    d9_keep_resident(area, asize);  // (the rewritten stubs)\n")
+          b = "        FATAL(\"[native] the HLE slots can't be made executable (errno %d)\\n\", errno);\n"
+          s = once(s, b, b + "    d9_keep_resident(HLE_BASE, size);  // (Dimensity 9000 profile)\n")
+          open(p, "w", encoding="utf-8").write(s)
+          print("Dimensity 9000 profile: hooks applied")
+          D9_PY_EOF
+          python3 /tmp/d9_hooks.py
+          grep -n 'd9_' runtime/platform/android.c runtime/native.c
+      - name: Make this a separate app (so your installed one is not replaced)
+        run: |
+          sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
+          grep -n applicationId android/botwrecompandroid/app/build.gradle.kts
+
+      - name: Restore the signing key (so new builds can update the old one)
+        id: signkey
+        uses: actions/cache@v4
+        with:
+          path: ~/.botwrecompandroid
+          key: signing-key-v1
+
+      - name: Create the signing key (only the first time)
+        if: steps.signkey.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.botwrecompandroid
+          keytool -genkeypair -keystore ~/.botwrecompandroid/test.jks -storepass botwtest123 -keypass botwtest123 -alias botwtest -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=BOTW test build"
+          printf 'storeFile=%s\nstorePassword=botwtest123\nkeyAlias=botwtest\nkeyPassword=botwtest123\n' "$HOME/.botwrecompandroid/test.jks" > ~/.botwrecompandroid/keystore.properties
+
+      - name: Build the APK
+        working-directory: android/botwrecompandroid
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: botw-apk
+          path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
